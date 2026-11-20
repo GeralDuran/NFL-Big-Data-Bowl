@@ -1,5 +1,4 @@
 .venv/
- HEAD
 .hackathon/.tools/
 .hackathon/.cache/
 .hackathon/.bootstrap/
@@ -15,9 +14,3 @@ __pycache__/
 *.pem
 *.key
 .aws/
-
-node_modules/
-__pycache__/
-.env
-dist/
-bd048d215491b389933b9438f60d24f3d6c252d5
