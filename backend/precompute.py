@@ -54,7 +54,7 @@ def find_tracking_files(data_dir: Path) -> dict[int, Path]:
 
 # --- Lectura ---------------------------------------------------------------
 
-GAMES_COLS = ["gameId", "week", "homeTeamAbbr", "visitorTeamAbbr"]
+GAMES_COLS = ["gameId", "season", "week", "homeTeamAbbr", "visitorTeamAbbr"]
 PLAYS_COLS = [
     "gameId", "playId", "quarter", "down", "yardsToGo", "possessionTeam", "defensiveTeam",
     "passResult", "dropBackType", "pff_playAction", "pff_passCoverage", "pff_passCoverageType",
@@ -357,8 +357,43 @@ def with_names(t: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
+CUBE_METRICS = ["n", "nt", "res", "c", "s", "ttt", "pct", "twm", "twx", "ntw", "psi", "npsi", "pr", "pa"]
+CUBE_KEY_NAMES = {
+    "dist_bucket": "distance", "pff_passCoverageType": "coverage_type", "pff_passCoverage": "coverage",
+    "pff_playAction": "play_action", "offenseFormation": "formation", "pff_blockType": "block_type",
+}
+
+
+def cube(df: pd.DataFrame, keys: list[str]) -> dict:
+    """Tabla de sumas y conteos por combinación de filtros.
+
+    Como son aditivas, el dashboard puede combinar cualquier filtro y recalcular promedios
+    (promedio = suma / conteo). Cada fila es [*claves, *métricas].
+    """
+    t = (
+        df.groupby(keys, observed=True)
+        .agg(
+            n=("playId", "size"), nt=("ttt", "count"), res=("playResult", "sum"),
+            c=("is_c", "sum"), s=("is_s", "sum"), ttt=("ttt", "sum"), pct=("pct", "sum"),
+            twm=("tws_mean", "sum"), twx=("tws_max", "sum"), ntw=("tws_max", "count"),
+            psi=("psi_w", "sum"), npsi=("psi_w", "count"),
+            pr=("pressure_reached", "sum"), pa=("pressure_allowed", "sum"),
+        )
+        .reset_index()
+    )
+    return {
+        "keys": [CUBE_KEY_NAMES.get(k, k) for k in keys],
+        "metrics": CUBE_METRICS,
+        "rows": clean(t[keys + CUBE_METRICS].astype(object).values.tolist()),
+    }
+
+
 def build_matrix(full: pd.DataFrame, blk: pd.DataFrame) -> dict:
     base = full[full["down"].between(1, 4)]
+    cube_keys = ["down", "dist_bucket", "pff_passCoverageType", "pff_passCoverage", "pff_playAction"]
+    # Una jugada cuenta una vez por cada tipo de bloqueo que aparece en ella.
+    blk_plays = blk.loc[blk["pff_blockType"].notna(), PLAY_KEY + ["pff_blockType"]].drop_duplicates()
+    base_blk = base.merge(blk_plays, on=PLAY_KEY)
 
     def one(df: pd.DataFrame, col: str, sort_n: bool = True) -> list[dict]:
         t = agg_table(df, [col]).rename(columns={col: "value"})
@@ -383,6 +418,8 @@ def build_matrix(full: pd.DataFrame, blk: pd.DataFrame) -> dict:
         "formation": one(full, "offenseFormation"),
         "play_action": one(full, "pff_playAction", sort_n=False),
         "block_type": records(bt_t),
+        "cube_formation": cube(base, cube_keys + ["offenseFormation"]),
+        "cube_block": cube(base_blk, cube_keys + ["pff_blockType"]),
         "down_distance": records(
             agg_table(base, ["down", "dist_bucket"]).rename(columns={"dist_bucket": "distance"})
         ),
@@ -493,7 +530,7 @@ FILM_CATEGORIES = [
     ("play_action_window", "Play action con ventana"),
 ]
 FILM_PER_CATEGORY = 4
-FILM_FRAMES_AFTER_PASS = 10  # 1 s después del pase
+FILM_FRAMES_AFTER_PASS = 30  # hasta 3 s tras el pase; el tracking de esta muestra termina ~0.3 s después
 
 
 def select_film_plays(full: pd.DataFrame) -> pd.DataFrame:
@@ -554,6 +591,7 @@ def build_film_play(trk: pd.DataFrame, pff_game: pd.DataFrame, players: pd.DataF
             "role": meta["pff_role"].get(int(nfl_id)),
             "team": str(g["team"].dropna().iat[0]) if g["team"].notna().any() else None,
             "x": xs, "y": ys,
+            "o": np.round(g["o"].to_numpy(dtype=float), 0),
         })
 
     # Distancias por frame: Pass rush más cercano al QB y mayor separación de un receptor.
@@ -584,6 +622,8 @@ def build_film_play(trk: pd.DataFrame, pff_game: pd.DataFrame, players: pd.DataF
         "snap_frame": snap, "pass_frame": pas, "pass_index": pas - snap,
         "los_x": ball["x"][0] if ball is not None else None,
         "clock": (frames - snap) / FRAMES_PER_SECOND,
+        "events": t.dropna(subset=["event"]).drop_duplicates("frameId").set_index("frameId")["event"]
+        .reindex(frames).astype(object).where(lambda s: s.notna(), None).tolist(),
         "min_rush_qb_dist": min_rush,
         "max_receiver_separation": max_sep,
         "players": ents,
@@ -612,6 +652,7 @@ def build_summary(data_dir: Path) -> dict:
     summary = {
         "meta": {
             "project": "PocketClock AI",
+            "season": int(games["season"].iloc[0]) if games["season"].nunique() == 1 else None,
             "pressure_radius_yd": PRESSURE_RADIUS,
             "frames_per_second": FRAMES_PER_SECOND,
             "psi_cap_p99": round(psi_cap, 3),
